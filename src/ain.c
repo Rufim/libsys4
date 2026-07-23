@@ -25,7 +25,6 @@
 #include <string.h>
 #include <libgen.h>
 #include <assert.h>
-#include <zlib.h>
 
 #include "little_endian.h"
 #include "system4.h"
@@ -35,6 +34,7 @@
 #include "system4/instructions.h"
 #include "system4/mt19937int.h"
 #include "system4/string.h"
+#include "system4/zlib.h"
 
 struct func_list {
 	int nr_slots;
@@ -1192,14 +1192,7 @@ static bool read_tag(struct ain_reader *r, struct ain *ain)
 	if (TAG_EQ("VERS")) {
 		start_section(r, &ain->VERS);
 		ain->version = read_int32(r);
-		if (AIN_VERSION_GTE(ain, 11, 0)) {
-			instructions[CALLHLL].nr_args = 3;
-			instructions[NEW].nr_args = 2;
-			instructions[S_MOD].nr_args = 1;
-			instructions[OBJSWAP].nr_args = 1;
-			instructions[DG_STR_TO_METHOD].nr_args = 1;
-			instructions[CALLMETHOD].args[0] = T_INT;
-		}
+		initialize_instructions(ain->version);
 		// XXX: default to 14.1 (14.0 games handled individually)
 		if (ain->version == 14)
 			ain->minor_version = 1;
@@ -1321,14 +1314,8 @@ static uint8_t *decompress_ain(uint8_t *in, long *len)
 		return NULL;
 
 	out = xmalloc(out_len);
-	int r = uncompress(out, (unsigned long*)&out_len, in+16, in_len);
-	if (r != Z_OK) {
-		if (r == Z_BUF_ERROR)
-			WARNING("uncompress failed: Z_BUF_ERROR");
-		else if (r == Z_MEM_ERROR)
-			WARNING("uncompress failed: Z_MEM_ERROR");
-		else if (r == Z_DATA_ERROR)
-			WARNING("uncompress failed: Z_DATA_ERROR");
+	if (!zlib_decompress_exact(out, out_len, in+16, in_len)) {
+		WARNING("ain: zlib_decompress failed");
 		free(out);
 		return NULL;
 	}
@@ -1482,6 +1469,7 @@ struct ain *ain_new(int major_version, int minor_version)
 
 	ain->version = major_version;
 	ain->minor_version = minor_version;
+	initialize_instructions(ain->version);
 	ain->main = -1;
 	ain->msgf = -1;
 	ain->ojmp = -1;

@@ -233,7 +233,7 @@ struct flat_library {
 	size_t size;
 	uint8_t *decoded; // only for ELNA-encrypted data.
 	union {
-		struct { const uint8_t *data; size_t size; int32_t uk_int; } cg;
+		struct { const uint8_t *data; size_t size; bool generate_mipmap; } cg;
 		struct { struct flat_timeline *timelines; size_t nr_timelines; } timeline;
 		struct flat_stop_motion stop_motion;
 		struct flat_emitter emitter;
@@ -283,5 +283,11 @@ struct flat {
 
 struct flat *flat_open(uint8_t *data, size_t size, int *error);
 void flat_free(struct flat *fl);
+void flat_free_library(struct flat_library *lib);
+
+struct buffer;
+void flat_write_header(struct buffer *b, const struct flat_header *hdr);
+void flat_write_timelines(struct buffer *b, const struct flat_timeline *tls, size_t n, int version);
+void flat_write_library_payload(struct buffer *b, const struct flat_library *lib, int version);
 
 #endif /* SYSTEM4_FLAT_H */
