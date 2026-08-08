@@ -246,6 +246,12 @@ static bool gsave_validate_value(int32_t val, enum ain_data_type type, struct gs
 		return 0 <= val && val < gs->nr_records;
 	case AIN_ARRAY_TYPE:
 		return 0 <= val && val < gs->nr_arrays;
+	// Generic-массив (array<?>, Ixseal): значение — тот же индекс в arrays.
+	// -1 тоже валиден: его писали старые сборки, у которых тип 79 не
+	// сериализовался вовсе, — иначе один такой глобал браковал ВЕСЬ файл
+	// группы (AFConfig.asd «Invalid save file», конфиг сбрасывался).
+	case AIN_ARRAY:
+		return (0 <= val && val < gs->nr_arrays) || val == -1;
 	default:
 		return false;
 	}
