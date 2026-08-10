@@ -151,7 +151,13 @@ struct gsave *gsave_create(int version, const char *key, int nr_ain_globals, con
 	gs->key = strdup(key);
 	gs->uk1 = 1000;
 	gs->version = version;
-	gs->uk2 = 56;
+	/*
+	 * `uk2` — РАЗМЕР фиксированной части заголовка: у версий 4–7 это 56 (14 int32),
+	 * у девятой 64, ровно на два int32 больше — то есть на добавленную там пару
+	 * (comments_offset, nr_comments). Windows-сборка Dohna пишет 64 во всех своих
+	 * файлах; пишем так же, иначе её загрузчик увидит чужой размер заголовка.
+	 */
+	gs->uk2 = version >= 9 ? 64 : 56;
 	gs->nr_ain_globals = nr_ain_globals;
 	if (version >= 5)
 		gs->group = strdup(group ? group : "");
@@ -686,13 +692,19 @@ int32_t gsave_add_struct_def(struct gsave *gs, struct ain_struct *st)
 	for (int i = 0; i < st->nr_members; i++) {
 		sd->fields[i].type = st->members[i].type.data;
 		/*
-		 * v9: параметр типа. У Windows-сборки Dohna он обычно повторяет сам тип,
-		 * а у обёрток (`AIN_OPTION`/`AIN_WRAP`) несёт ТИП СОДЕРЖИМОГО — это видно
-		 * на 17 полях её сейва, где рядом с 86 стоят 13/12/10. Пишем так же:
-		 * есть вложенный тип — берём его, иначе дублируем.
+		 * Правило снято подсчётом ВСЕХ пар (тип, параметр) в сейве Windows-сборки:
+		 * параметр ДУБЛИРУЕТ тип везде (0,10,12,13,47,63,79,92 — 220 полей), и
+		 * только у `AIN_OPTION` (86) несёт тип содержимого — 17 полей с 10/12/13.
+		 * ★Особенно важен generic-массив (79): там параметр тоже 79, а не тип
+		 * элемента. Пока мы писали туда элемент, оригинал наш сейв читал, но
+		 * коллекции поднимал ПУСТЫМИ — на одном и том же файле у него выходило
+		 * «TALENT 0/5», а у нас «TALENT 3».
+		 * `AIN_WRAP`/`AIN_IFACE_WRAP` в этом файле не встречаются — для них
+		 * оставлено дублирование, проверить не на чем.
 		 */
 		struct ain_type *inner = st->members[i].type.array_type;
-		sd->fields[i].type_param = inner ? inner->data : st->members[i].type.data;
+		sd->fields[i].type_param = (st->members[i].type.data == AIN_OPTION && inner)
+			? inner->data : st->members[i].type.data;
 		sd->fields[i].name = strdup(st->members[i].name);
 	}
 
