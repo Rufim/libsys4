@@ -209,6 +209,13 @@ void gsave_free(struct gsave *gs)
 		}
 		free(gs->struct_defs);
 	}
+	if (gs->comments) {
+		for (int32_t i = 0; i < gs->nr_comments; i++) {
+			if (gs->comments[i])
+				free_string(gs->comments[i]);
+		}
+		free(gs->comments);
+	}
 	free(gs);
 }
 
@@ -240,8 +247,21 @@ static bool gsave_validate_value(int32_t val, enum ain_data_type type, struct gs
 	case AIN_FLOAT:
 	case AIN_REF_TYPE:
 		return true;
+	/*
+	 * Перечисления (Ixseal): значение — обычное целое, ссылок никуда нет.
+	 * У Dohna в сейве Windows-версии 92 (`AIN_ENUM`) стоит у одного flat-массива из
+	 * 604; из-за него весь файл браковался как «Invalid save file» уже ПОСЛЕ того,
+	 * как версия 9 стала разбираться. 91 (`AIN_ENUM2`) добавлен заодно — он тот же
+	 * enum, но в роли типа элемента массива.
+	 */
+	case AIN_ENUM:
+	case AIN_ENUM2:
+		return true;
 	case AIN_STRING:
-		return (0 <= val && val < gs->nr_strings) || val == GSAVE7_EMPTY_STRING;
+		// −1 — «пустая строка» у Windows-сборки Dohna (v9); xsystem4 для того же
+		// пишет GSAVE7_EMPTY_STRING. Оба варианта валидны.
+		return (0 <= val && val < gs->nr_strings) || val == GSAVE7_EMPTY_STRING
+			|| val == -1;
 	case AIN_STRUCT:
 		return 0 <= val && val < gs->nr_records;
 	case AIN_ARRAY_TYPE:
@@ -265,7 +285,19 @@ enum savefile_error gsave_parse(uint8_t *buf, size_t len, struct gsave *gs)
 	gs->key = strdup(buffer_skip_string(&r));
 	gs->uk1 = buffer_read_int32(&r);
 	gs->version = buffer_read_int32(&r);
-	if (gs->version != 4 && gs->version != 5 && gs->version != 7)
+	/*
+	 * Версия 9 — Windows-сборка Dohna Dohna. От семёрки отличается ТРЕМЯ вещами
+	 * (снято разбором SaveData1000.asd: все границы секций сошлись до последнего
+	 * байта, файл прочитан целиком):
+	 *   1. в заголовке после (keyvals_offset, nr_keyvals) стоит ЕЩЁ ОДНА пара —
+	 *      (comments_offset, nr_comments), секция лежит в самом конце файла;
+	 *   2. тип у глобала и у поля struct-def стал ПАРОЙ (тип, параметр типа):
+	 *      видно там, где параметр отличается — `86` (wrap/option) идёт с 13/12/10
+	 *      у 17 полей `LocalGame`/`DungeonMusicInfo`/`ShopDisplayUnit` и др.;
+	 *   3. у глобала после значения появилось ещё одно поле (во всех виденных
+	 *      файлах ноль).
+	 */
+	if (gs->version != 4 && gs->version != 5 && gs->version != 7 && gs->version != 9)
 		return SAVEFILE_UNSUPPORTED_FORMAT;
 	gs->uk2 = buffer_read_int32(&r);
 	gs->nr_ain_globals = buffer_read_int32(&r);
@@ -280,6 +312,12 @@ enum savefile_error gsave_parse(uint8_t *buf, size_t len, struct gsave *gs)
 	gs->nr_arrays = buffer_read_int32(&r);
 	size_t keyvals_offset = buffer_read_int32(&r);
 	gs->nr_keyvals = buffer_read_int32(&r);
+
+	size_t comments_offset = 0;
+	if (gs->version >= 9) {
+		comments_offset = buffer_read_int32(&r);
+		gs->nr_comments = buffer_read_int32(&r);
+	}
 
 	if (gs->version >= 5) {
 		gs->group = strdup(buffer_skip_string(&r));
@@ -324,7 +362,12 @@ enum savefile_error gsave_parse(uint8_t *buf, size_t len, struct gsave *gs)
 	gs->globals = xcalloc(gs->nr_globals, sizeof(struct gsave_global));
 	for (struct gsave_global *g = gs->globals; g < gs->globals + gs->nr_globals; g++) {
 		g->type = buffer_read_int32(&r);
+		// v9: параметр типа (для wrap/option) и ещё одно поле после значения.
+		if (gs->version >= 9)
+			g->type_param = buffer_read_int32(&r);
 		g->value = buffer_read_int32(&r);
+		if (gs->version >= 9)
+			g->uk9 = buffer_read_int32(&r);
 		g->name = strdup(buffer_skip_string(&r));
 		if (gs->version <= 5)
 			g->unknown = buffer_read_int32(&r);
@@ -404,9 +447,20 @@ enum savefile_error gsave_parse(uint8_t *buf, size_t len, struct gsave *gs)
 			sd->fields = xcalloc(sd->nr_fields, sizeof(struct gsave_field_def));
 			for (struct gsave_field_def *fd = sd->fields; fd < sd->fields + sd->nr_fields; fd++) {
 				fd->type = buffer_read_int32(&r);
+				if (gs->version >= 9)
+					fd->type_param = buffer_read_int32(&r);
 				fd->name = strdup(buffer_skip_string(&r));
 			}
 		}
+	}
+
+	// comments (version 9+) — паскалевские строки, длина int32 + байты без нуля.
+	if (gs->version >= 9 && gs->nr_comments > 0) {
+		if (r.index != comments_offset)
+			return SAVEFILE_INVALID;
+		gs->comments = xcalloc(gs->nr_comments, sizeof(struct string *));
+		for (int i = 0; i < gs->nr_comments; i++)
+			gs->comments[i] = buffer_read_pascal_string(&r);
 	}
 
 	return SAVEFILE_SUCCESS;
@@ -440,6 +494,13 @@ enum savefile_error gsave_write(struct gsave *gs, FILE *out, bool encrypt, int c
 	size_t keyvals_offset_loc = skip_int32(&w);
 	buffer_write_int32(&w, gs->nr_keyvals);
 
+	// v9: пара для секции комментария слота (сама секция пишется в самом конце).
+	size_t comments_offset_loc = 0;
+	if (gs->version >= 9) {
+		comments_offset_loc = skip_int32(&w);
+		buffer_write_int32(&w, gs->nr_comments);
+	}
+
 	if (gs->version >= 5)
 		buffer_write_cstringz(&w, gs->group);
 
@@ -461,7 +522,11 @@ enum savefile_error gsave_write(struct gsave *gs, FILE *out, bool encrypt, int c
 	buffer_write_int32_at(&w, globals_offset_loc, w.index);
 	for (struct gsave_global *g = gs->globals; g < gs->globals + gs->nr_globals; g++) {
 		buffer_write_int32(&w, g->type);
+		if (gs->version >= 9)
+			buffer_write_int32(&w, g->type_param);
 		buffer_write_int32(&w, g->value);
+		if (gs->version >= 9)
+			buffer_write_int32(&w, g->uk9);
 		buffer_write_cstringz(&w, g->name);
 		if (gs->version <= 5)
 			buffer_write_int32(&w, g->unknown);
@@ -510,8 +575,21 @@ enum savefile_error gsave_write(struct gsave *gs, FILE *out, bool encrypt, int c
 			buffer_write_int32(&w, sd->nr_fields);
 			for (struct gsave_field_def *fd = sd->fields; fd < sd->fields + sd->nr_fields; fd++) {
 				buffer_write_int32(&w, fd->type);
+				if (gs->version >= 9)
+					buffer_write_int32(&w, fd->type_param);
 				buffer_write_cstringz(&w, fd->name);
 			}
+		}
+	}
+
+	// comments (v9) — паскалевские строки; секция всегда последняя.
+	if (gs->version >= 9) {
+		buffer_write_int32_at(&w, comments_offset_loc, w.index);
+		for (int i = 0; i < gs->nr_comments; i++) {
+			struct string *c = gs->comments ? gs->comments[i] : NULL;
+			buffer_write_int32(&w, c ? c->size : 0);
+			if (c && c->size)
+				buffer_write_bytes(&w, (uint8_t *)c->text, c->size);
 		}
 	}
 
@@ -607,6 +685,14 @@ int32_t gsave_add_struct_def(struct gsave *gs, struct ain_struct *st)
 
 	for (int i = 0; i < st->nr_members; i++) {
 		sd->fields[i].type = st->members[i].type.data;
+		/*
+		 * v9: параметр типа. У Windows-сборки Dohna он обычно повторяет сам тип,
+		 * а у обёрток (`AIN_OPTION`/`AIN_WRAP`) несёт ТИП СОДЕРЖИМОГО — это видно
+		 * на 17 полях её сейва, где рядом с 86 стоят 13/12/10. Пишем так же:
+		 * есть вложенный тип — берём его, иначе дублируем.
+		 */
+		struct ain_type *inner = st->members[i].type.array_type;
+		sd->fields[i].type_param = inner ? inner->data : st->members[i].type.data;
 		sd->fields[i].name = strdup(st->members[i].name);
 	}
 

@@ -74,6 +74,16 @@ struct gsave {
 	int32_t nr_struct_defs;
 	int32_t cap_struct_defs;
 	struct gsave_struct_def *struct_defs;
+	/*
+	 * version 9+ — КОММЕНТАРИЙ СЛОТА ВНУТРИ ФАЙЛА. У версии 7 его в gsave нет
+	 * вовсе, и xsystem4 хранит строку сайдкаром `<имя>.asd.cmt`; Windows-версия
+	 * Dohna пишет её сюда, отдельной секцией со своей парой (смещение, число) в
+	 * заголовке. Содержимое — та же строка с разделителями `|`, что и в сайдкаре:
+	 * «0|1|2|false|2026/08/09 09:50:45|ToDo: End the phase…|Jumping Cross».
+	 */
+	int32_t nr_comments;
+	int32_t cap_comments;
+	struct string **comments;
 };
 
 enum gsave_record_type {
@@ -91,7 +101,11 @@ struct gsave_record {
 
 struct gsave_global {
 	enum ain_data_type type;
+	// v9: параметр типа — для wrap/option он несёт тип содержимого (у остальных
+	// повторяет сам тип). Хранится, чтобы файл можно было записать обратно без потерь.
+	int32_t type_param;
 	int32_t value;
+	int32_t uk9;      // version 9+, во всех виденных файлах 0
 	char *name;
 	int32_t unknown;  // version <=5, always 1?
 };
@@ -128,6 +142,7 @@ struct gsave_struct_def {
 
 struct gsave_field_def {
 	enum ain_data_type type;
+	int32_t type_param;  // version 9+, см. gsave_global::type_param
 	char *name;
 };
 
