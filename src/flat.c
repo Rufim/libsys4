@@ -247,6 +247,13 @@ static void read_graphic_tl(struct flat_timeline *tl, struct buffer *r, const in
 			tl->graphic.frames[f].count = n;
 		}
 
+		// Во всех известных v15-файлах на кадр приходится РОВНО ОДИН ключ, и
+		// потребители (flat_timeline_key) читают только его. Жалуемся по факту
+		// прихода данных с несколькими ключами, а не «на всякий случай».
+		if (n > 1) {
+			WARNING("Graphic frame %zu has %u keys; only the first is used", f, n);
+		}
+
 		tl->graphic.frames[f].keys = xcalloc(n, sizeof *tl->graphic.frames[f].keys);
 		for (size_t i = 0; i < n; i++) {
 			parse_graphic_key(r, &tl->graphic.frames[f].keys[i], version);

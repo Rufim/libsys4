@@ -281,6 +281,28 @@ struct flat {
 
 
 
+/*
+ * Ключи графического таймлайна до версии 14 лежат ОДНИМ массивом на кадры
+ * (`graphic.keys`), а с версии 15 файл хранит СПИСОК ключей НА КАЖДЫЙ КАДР
+ * (`graphic.frames`). Отсюда единый доступ «ключ кадра»: без него читатель
+ * v15-файла видит `graphic.count == 0` и пропускает все кадры, то есть флэт
+ * молча не рисуется (Haha Ranman — первая игра с версией 15).
+ * NULL — у кадра ключа нет.
+ */
+static inline const struct flat_key_data_graphic *flat_timeline_key(
+		const struct flat_timeline *tl, int frame)
+{
+	if (tl->type != FLAT_TIMELINE_GRAPHIC || frame < 0 || frame >= tl->frame_count)
+		return NULL;
+	if (tl->graphic.frames) {
+		const struct flat_key_frame_graphic *f = &tl->graphic.frames[frame];
+		return f->count ? &f->keys[0] : NULL;
+	}
+	if ((uint32_t)frame >= tl->graphic.count)
+		return NULL;
+	return &tl->graphic.keys[frame];
+}
+
 struct flat *flat_open(uint8_t *data, size_t size, int *error);
 void flat_free(struct flat *fl);
 void flat_free_library(struct flat_library *lib);
