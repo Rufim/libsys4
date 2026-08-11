@@ -28,13 +28,27 @@ enum flat_error {
 };
 
 
+/*
+ * Секция TALT — ОДИН графический файл (атлас) на запись плюс `nr_meta` описаний
+ * подкартинок в нём. У части флэтов (Haha Ranman: `ＡＤＶ／オートモード`,
+ * `ＡＤＶ／スキップモード`, `修復`, `昇段`; четыре флэта Ixseal-игр) секция LIBL
+ * ПУСТА, и слои таймлайна ссылаются именно на эти подкартинки по имени
+ * (`AUTO.png`, `緑丸.png`, `光.png`).
+ *
+ * Смысл полей записи разобран по постоянному хвосту имени (`.png` под XOR 0x55):
+ * `unknown1` — ИМЯ подкартинки, `unknown2/3` — её x/y в атласе, `unknown4/5` —
+ * ширина/высота. Имена сложены с теми, что просит MTLC, на четырёх файлах.
+ * Старые поля оставлены как есть (по ним alice-tools пишет секцию обратно),
+ * расшифрованное имя лежит рядом в `name`.
+ */
 struct talt_metadata {
 	uint32_t unknown1_size;
 	uint32_t unknown1_off;
-	uint32_t unknown2;
-	uint32_t unknown3;
-	uint32_t unknown4;
-	uint32_t unknown5;
+	uint32_t unknown2;  // x подкартинки в атласе
+	uint32_t unknown3;  // y
+	uint32_t unknown4;  // ширина
+	uint32_t unknown5;  // высота
+	struct string *name;  // unknown1 в открытом виде: имя библиотеки-подкартинки
 };
 
 struct talt_entry {

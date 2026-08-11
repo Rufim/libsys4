@@ -115,6 +115,10 @@ void flat_free(struct flat *fl)
 	}
 	free(fl->libraries);
 	for (unsigned i = 0; i < fl->nr_talt_entries; i++) {
+		for (unsigned j = 0; j < fl->talt_entries[i].nr_meta; j++) {
+			if (fl->talt_entries[i].metadata[j].name)
+				free_string(fl->talt_entries[i].metadata[j].name);
+		}
 		free(fl->talt_entries[i].metadata);
 	}
 	free(fl->talt_entries);
@@ -136,8 +140,15 @@ static void read_talt(struct flat *fl)
 		fl->talt_entries[i].size = buffer_read_int32(&r);
 		fl->talt_entries[i].off = fl->talt.off + r.index + 8;
 
-		if (strncmp(buffer_strdata(&r), "AJP", 4) != 0)
-			WARNING("File in flat TALT section is not ajp format");
+		/*
+		 * В TALT лежит не только AJP: у Haha Ranman и Ixseal-игр это QNT
+		 * (атлас подкартинок, §5ea). Прежняя жалоба «is not ajp format»
+		 * срабатывала на каждом таком файле и называла дефектом штатный
+		 * формат — жалуемся только на ДЕЙСТВИТЕЛЬНО незнакомую подпись.
+		 */
+		const char *talt_magic = buffer_strdata(&r);
+		if (strncmp(talt_magic, "AJP", 4) != 0 && strncmp(talt_magic, "QNT", 4) != 0)
+			WARNING("Unknown image format '%.3s' in flat TALT section", talt_magic);
 
 		buffer_skip(&r, fl->talt_entries[i].size);
 		buffer_align(&r, 4);
@@ -145,15 +156,29 @@ static void read_talt(struct flat *fl)
 		fl->talt_entries[i].nr_meta = buffer_read_int32(&r);
 		fl->talt_entries[i].metadata = xcalloc(fl->talt_entries[i].nr_meta, sizeof(struct talt_metadata));
 		for (unsigned j = 0; j < fl->talt_entries[i].nr_meta; j++) {
-			fl->talt_entries[i].metadata[j].unknown1_size = buffer_read_int32(&r);
-			fl->talt_entries[i].metadata[j].unknown1_off = fl->talt.off + r.index + 8;
-			buffer_skip(&r, fl->talt_entries[i].metadata[j].unknown1_size);
+			struct talt_metadata *md = &fl->talt_entries[i].metadata[j];
+			md->unknown1_size = buffer_read_int32(&r);
+			md->unknown1_off = fl->talt.off + r.index + 8;
+			/*
+			 * Имя подкартинки шифруется тем же однобайтным XOR 0x55, что и
+			 * имена библиотек LIBL при наличии ELNA (постоянный хвост `{%;2`
+			 * = `.png` — по нему ключ и найден). Без ELNA берём как есть.
+			 */
+			if (md->unknown1_size && buffer_remaining(&r) >= md->unknown1_size) {
+				uint8_t *src = buffer_data(&r);
+				uint8_t *tmp = xmalloc(md->unknown1_size);
+				for (size_t k = 0; k < md->unknown1_size; k++)
+					tmp[k] = fl->elna.present ? (src[k] ^ 0x55) : src[k];
+				md->name = make_string((char*)tmp, md->unknown1_size);
+				free(tmp);
+			}
+			buffer_skip(&r, md->unknown1_size);
 			buffer_align(&r, 4);
 
-			fl->talt_entries[i].metadata[j].unknown2 = buffer_read_int32(&r);
-			fl->talt_entries[i].metadata[j].unknown3 = buffer_read_int32(&r);
-			fl->talt_entries[i].metadata[j].unknown4 = buffer_read_int32(&r);
-			fl->talt_entries[i].metadata[j].unknown5 = buffer_read_int32(&r);
+			md->unknown2 = buffer_read_int32(&r);
+			md->unknown3 = buffer_read_int32(&r);
+			md->unknown4 = buffer_read_int32(&r);
+			md->unknown5 = buffer_read_int32(&r);
 		}
 	}
 
