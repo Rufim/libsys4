@@ -358,6 +358,14 @@ struct ain {
 const char *ain_strerror(int error);
 const char *ain_strtype(struct ain *ain, enum ain_data_type type, int struct_type);
 char *ain_strtype_d(struct ain *ain, struct ain_type *v);
+/*
+ * Имя функции С СИГНАТУРОЙ, в том виде, в каком его пишет в сейв System40:
+ * `main()`, `parts::detail::WaitForClick(FTPARTS_WaitForClickCallback, bool)`,
+ * `MapView@Move(MapEdge&, DG_Event)`. Именно сигнатура (а не суффиксы вроде
+ * `#N`) отличает у оригинала перегрузки друг от друга. Строку освобождает
+ * вызывающий.
+ */
+char *ain_function_signature(struct ain *ain, struct ain_function *f);
 const char *ain_variable_to_string(struct ain *ain, struct ain_variable *v);
 uint8_t *ain_read(const char *path, long *len, int *error);
 struct ain *ain_open(const char *path, int *error);

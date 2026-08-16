@@ -678,6 +678,91 @@ char *ain_strtype_d(struct ain *ain, struct ain_type *v)
 	}
 }
 
+/*
+ * Тип АРГУМЕНТА так, как его печатает в сигнатуру System40. От ain_strtype_d
+ * отличается тем, что передача по ссылке обозначается СУФФИКСОМ `&`, а не
+ * префиксом `ref`: у оригинала в сейве `MapView@Move(MapEdge&, DG_Event)` и
+ * `parts::detail::AddPartsUpdate(array<parts::detail::SPartsUpdateData>&)`.
+ */
+static char *arg_type_string(struct ain *ain, struct ain_type *t)
+{
+	switch (t->data) {
+	/*
+	 * ЕДИНСТВЕННОЕ, что оригинал помечает суффиксом `&`, — это `wrap<T>`:
+	 * `MapView@Move(MapEdge&, DG_Event)` при объявлении `wrap<MapEdge>`,
+	 * `wrap<array<...>>` → `array<...>&`. Обычные `ref`-типы он печатает
+	 * ПРЕФИКСОМ (`SceneMap@<lambda …>(ref MapRoute)`), как и ain_strtype_d,
+	 * поэтому их трогать не надо. Обёртка над интерфейсом — особый случай:
+	 * её System40 сам не разбирает и пишет `unknown_type&`.
+	 */
+	case AIN_WRAP:
+		if (t->array_type && t->array_type->data != AIN_IFACE_WRAP) {
+			char *inner = ain_strtype_d(ain, t->array_type);
+			char *out = type_sprintf("%s&", inner);
+			free(inner);
+			return out;
+		}
+		return strdup("unknown_type&");
+	// `ref <интерфейс>` — префиксом: `AnimateText::CreateComponent(ref IUserComponentParts)`
+	case AIN_IFACE:
+		if (t->struc >= 0 && ain && t->struc < ain->nr_structures)
+			return type_sprintf("ref %s", ain->structures[t->struc].name);
+		return strdup("ref interface");
+	// `option<T>` в сигнатуре — `T?`: `<lambda …>(int?)`
+	case AIN_OPTION:
+		if (t->array_type) {
+			char *inner = ain_strtype_d(ain, t->array_type);
+			char *out = type_sprintf("%s?", inner);
+			free(inner);
+			return out;
+		}
+		return strdup("unknown_type?");
+	/*
+	 * Имя перечисления в .ain несёт служебный суффикс `#92`/`#91` (так его
+	 * именует загрузчик), а в сигнатуре оригинала стоит голое `SnapShotType`.
+	 */
+	case AIN_ENUM:
+	case AIN_ENUM2:
+		if (t->struc >= 0 && ain && t->struc < ain->nr_enums) {
+			char *name = strdup(ain->enums[t->struc].name);
+			char *hash = strrchr(name, '#');
+			if (hash)
+				*hash = '\0';
+			return name;
+		}
+		break;
+	default:
+		break;
+	}
+	return ain_strtype_d(ain, t);
+}
+
+char *ain_function_signature(struct ain *ain, struct ain_function *f)
+{
+	struct string *s = make_string(f->name, strlen(f->name));
+	string_push_back(&s, '(');
+	/*
+	 * Многослотовые значения объявлены как аргумент + `slots-1` филлеров
+	 * AIN_VOID подряд (см. decl_slots в движке) — в сигнатуру идёт только
+	 * сам аргумент, филлеры пропускаем.
+	 */
+	bool first = true;
+	for (int i = 0; i < f->nr_args; i++) {
+		if (f->vars[i].type.data == AIN_VOID)
+			continue;
+		if (!first)
+			string_append_cstr(&s, ", ", 2);
+		first = false;
+		char *t = arg_type_string(ain, &f->vars[i].type);
+		string_append_cstr(&s, t, strlen(t));
+		free(t);
+	}
+	string_push_back(&s, ')');
+	char *out = strdup(s->text);
+	free_string(s);
+	return out;
+}
+
 const char *ain_variable_to_string(struct ain *ain, struct ain_variable *v)
 {
 	static char buf[2048] = { [2047] = '\0' };
