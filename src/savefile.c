@@ -705,7 +705,33 @@ int32_t gsave_add_struct_def(struct gsave *gs, struct ain_struct *st)
 		struct ain_type *inner = st->members[i].type.array_type;
 		sd->fields[i].type_param = (st->members[i].type.data == AIN_OPTION && inner)
 			? inner->data : st->members[i].type.data;
-		sd->fields[i].name = strdup(st->members[i].name);
+		/*
+		 * ★ИМЯ ПОЛЯ — ЭТО ВТОРОЕ ИМЯ ЧЛЕНА (`name2`), а не первое.
+		 *
+		 * Правило снято с сейвов Windows-сборки (9–11 августа, 8 файлов):
+		 * 1554 поля, ноль расхождений — где `name2` пуст, в файле поле
+		 * БЕЗЫМЯННОЕ, где не пуст — записано дословно.
+		 *
+		 * Прежняя эвристика «имя в угловых скобках → пусто» правило лишь
+		 * приближала и врала в обе стороны: `<Turn>`, `<vtable>`, `<IsUsable>`
+		 * оригинал ПИШЕТ (у них `name2` заполнен), а `BattleContext.m_actions`,
+		 * `m_history`, `m_players`, `m_stocks` — обычные с виду имена — НЕ
+		 * пишет. Есть и филлеры с именем-огрызком (`BattleSkill` [4] зовётся
+		 * «d>»), под скобочное правило не подпадающим вовсе.
+		 *
+		 * Практический смысл прежний: у безымянных полей единственный ключ —
+		 * ПОЗИЦИЯ, и загрузчик обязан сопоставлять по ней (gsave_fill_struct);
+		 * поиск по имени сваливал тег второго `option` в слот первого, теряя
+		 * вместимость комнат.
+		 *
+		 * ★У .ain СТАРШЕ 12-й ВЕРСИИ второго имени нет вовсе (`name2` читается
+		 * только с v12, см. read_variables), и там пишем первое: иначе все поля
+		 * старых игр разом стали бы безымянными — формат, которого их
+		 * оригинальные сборки не пишут.
+		 */
+		const char *mname = st->members[i].name2 ? st->members[i].name2
+							: st->members[i].name;
+		sd->fields[i].name = strdup(mname ? mname : "");
 	}
 
 	return n;
@@ -732,9 +758,29 @@ static void rsave_free_string(struct rsave_heap_string *s)
 	free(s);
 }
 
+struct rsave_array_type *rsave_array_type_new(int32_t data_type, const char *struct_name,
+					      struct rsave_array_type *sub)
+{
+	struct rsave_array_type *t = xcalloc(1, sizeof(struct rsave_array_type));
+	t->data_type = data_type;
+	t->struct_name = struct_name ? strdup(struct_name) : NULL;
+	t->sub = sub;
+	return t;
+}
+
+void rsave_array_type_free(struct rsave_array_type *t)
+{
+	if (!t)
+		return;
+	rsave_array_type_free(t->sub);
+	free(t->struct_name);
+	free(t);
+}
+
 static void rsave_free_array(struct rsave_heap_array *a)
 {
 	free(a->struct_type.name);
+	rsave_array_type_free(a->type);
 	free(a);
 }
 
@@ -744,11 +790,15 @@ static void rsave_free_struct(struct rsave_heap_struct *s)
 	free(s->dtor.name);
 	free(s->struct_type.name);
 	free(s->types);
+	free(s->ifaces);
 	free(s);
 }
 
 static void rsave_free_delegate(struct rsave_heap_delegate *d)
 {
+	for (int i = 0; i < d->nr_entries; i++)
+		free(d->entries[i].method);
+	free(d->entries);
 	free(d);
 }
 
@@ -765,6 +815,10 @@ void rsave_free(struct rsave *rs)
 		free(rs->return_records[i].caller_func);
 	free(rs->return_records);
 	for (int i = 0; i < rs->nr_heap_objs; i++) {
+		// Разбор мог оборваться на середине кучи (битый или чужой файл) —
+		// тогда хвост слотов остался незаполненным.
+		if (!rs->heap[i])
+			continue;
 		enum rsave_heap_tag *tag = rs->heap[i];
 		switch (*tag) {
 		case RSAVE_GLOBALS:
@@ -840,6 +894,76 @@ static struct rsave_symbol parse_rsave_symbol(struct buffer *r, int32_t version)
 	return (struct rsave_symbol) { .name = strdup(buffer_skip_string(r)) };
 }
 
+/*
+ * Пишет ли версия 14 имя структуры/функтипа после дескриптора типа. Список снят
+ * с образа оригинала: перебор довели до того, что разбор доходит ровно до конца
+ * файла (§5fb-2). ★`AIN_OPTION` в списке НЕТ, хотя тип структурный.
+ */
+static bool rsave14_type_has_name(int32_t data_type)
+{
+	switch (data_type) {
+	case AIN_STRUCT:
+	case AIN_ARRAY_STRUCT:
+	case AIN_REF_STRUCT:
+	case AIN_REF_ARRAY_STRUCT:
+	case AIN_FUNC_TYPE:
+	case AIN_ARRAY_FUNC_TYPE:
+	case AIN_REF_FUNC_TYPE:
+	case AIN_REF_ARRAY_FUNC_TYPE:
+	case AIN_DELEGATE:
+	case AIN_ARRAY_DELEGATE:
+	case AIN_REF_DELEGATE:
+	case AIN_REF_ARRAY_DELEGATE:
+	case AIN_HLL_FUNC_71:
+	case AIN_WRAP:
+	case AIN_IFACE:
+	case AIN_ENUM2:
+	case AIN_ENUM:
+	case AIN_REF_ENUM:
+	case AIN_HLL_FUNC:
+	case AIN_IFACE_WRAP:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * Глубину вложенности диктует файл, поэтому она ограничена: у оригинала самая
+ * глубокая форма — `option<wrap<структура>>`, то есть три уровня. Без предела
+ * цепочка `has_sub = 1` из порченого образа уводит разбор в переполнение стека.
+ */
+#define RSAVE14_MAX_TYPE_DEPTH 16
+
+static struct rsave_array_type *parse_rsave14_type(struct buffer *r, int depth)
+{
+	if (depth > RSAVE14_MAX_TYPE_DEPTH)
+		return NULL;
+	struct rsave_array_type *t = xcalloc(1, sizeof(struct rsave_array_type));
+	t->data_type = buffer_read_int32(r);
+	int32_t has_sub = buffer_read_int32(r);
+	if (has_sub) {
+		t->sub = parse_rsave14_type(r, depth + 1);
+		if (!t->sub) {
+			free(t);
+			return NULL;
+		}
+	}
+	if (rsave14_type_has_name(t->data_type))
+		t->struct_name = strdup(buffer_skip_string(r));
+	return t;
+}
+
+// Имя структуры для загрузчика: у обёрток оно лежит в самом глубоком типе.
+static const char *rsave14_type_struct_name(struct rsave_array_type *t)
+{
+	for (; t; t = t->sub) {
+		if (t->struct_name && *t->struct_name)
+			return t->struct_name;
+	}
+	return "";
+}
+
 static struct rsave_call_frame *parse_call_frames(struct buffer *r, int *num)
 {
 	int32_t nr_local_ptrs, nr_frame_types, nr_struct_ptrs;
@@ -880,6 +1004,28 @@ static struct rsave_heap_frame *parse_heap_frame(struct buffer *r, int32_t versi
 {
 	struct rsave_heap_frame f = { .tag = tag };
 	f.ref = buffer_read_int32(r);
+	if (version >= 14) {
+		// Ни seq, ни таблицы типов переменных; у локалов — имя функции,
+		// struct_ptr и одно поле, которое во всех виденных образах -1.
+		if (tag == RSAVE_LOCALS) {
+			f.func.name = strdup(buffer_skip_string(r));
+			f.struct_ptr = buffer_read_int32(r);
+			f.env_ptr = buffer_read_int32(r);
+		} else {
+			f.func.id = -1;
+		}
+		int slots_size = buffer_read_int32(r);
+		if (slots_size < 0 || slots_size % sizeof(int32_t) != 0) {
+			free(f.func.name);
+			return NULL;
+		}
+		f.nr_slots = slots_size / sizeof(int32_t);
+		struct rsave_heap_frame *obj = xmalloc(sizeof(struct rsave_heap_frame) + slots_size);
+		*obj = f;
+		for (int i = 0; i < f.nr_slots; i++)
+			obj->slots[i] = buffer_read_int32(r);
+		return obj;
+	}
 	if (version >= 9)
 		f.seq = buffer_read_int32(r);
 	if (version == 4) {
@@ -914,6 +1060,14 @@ static struct rsave_heap_string *parse_heap_string(struct buffer *r, int32_t ver
 {
 	struct rsave_heap_string s = { .tag = RSAVE_STRING };
 	s.ref = buffer_read_int32(r);
+	if (version >= 14) {
+		// ни seq, ни uk
+		s.len = buffer_read_int32(r);
+		struct rsave_heap_string *obj = xmalloc(sizeof(struct rsave_heap_string) + s.len);
+		*obj = s;
+		buffer_read_bytes(r, (uint8_t *)obj->text, s.len);
+		return obj;
+	}
 	if (version >= 9)
 		s.seq = buffer_read_int32(r);
 	s.uk = buffer_read_int32(r);
@@ -930,6 +1084,40 @@ static struct rsave_heap_array *parse_heap_array(struct buffer *r, int32_t versi
 {
 	struct rsave_heap_array a = { .tag = RSAVE_ARRAY };
 	a.ref = buffer_read_int32(r);
+	if (version >= 14) {
+		a.type = parse_rsave14_type(r, 0);
+		if (!a.type)
+			return NULL;
+		// Плоские поля версии 9 заполняем из дерева, чтобы загрузчику
+		// образа не пришлось знать про версию файла.
+		/*
+		 * ★`wrap<интерфейс>` записан деревом `82<100>`, а движок держит такой
+		 * массив типом элемента AIN_IFACE_WRAP (100) — у него и ширина
+		 * элемента другая, чем у AIN_WRAP. Поэтому дерево сворачивается
+		 * обратно в 100, иначе круг «движок → файл → движок» не сходится.
+		 */
+		if (a.type->data_type == AIN_WRAP && a.type->sub
+				&& a.type->sub->data_type == AIN_IFACE_WRAP)
+			a.data_type = AIN_IFACE_WRAP;
+		else
+			a.data_type = a.type->data_type;
+		a.struct_type.name = strdup(rsave14_type_struct_name(a.type));
+		a.is_not_empty = buffer_read_int32(r);
+		int slots_size = buffer_read_int32(r);
+		if (slots_size < 0 || slots_size % sizeof(int32_t) != 0) {
+			rsave_array_type_free(a.type);
+			free(a.struct_type.name);
+			return NULL;
+		}
+		a.nr_slots = slots_size / sizeof(int32_t);
+		a.rank_minus_1 = a.nr_slots || a.is_not_empty ? 0 : -1;
+		a.root_rank = a.rank_minus_1 + 1;
+		struct rsave_heap_array *obj = xmalloc(sizeof(struct rsave_heap_array) + slots_size);
+		*obj = a;
+		for (int i = 0; i < a.nr_slots; i++)
+			obj->slots[i] = buffer_read_int32(r);
+		return obj;
+	}
 	if (version >= 9)
 		a.seq = buffer_read_int32(r);
 	a.rank_minus_1 = buffer_read_int32(r);
@@ -955,6 +1143,32 @@ static struct rsave_heap_struct *parse_heap_struct(struct buffer *r, int32_t ver
 {
 	struct rsave_heap_struct s = { .tag = RSAVE_STRUCT };
 	s.ref = buffer_read_int32(r);
+	if (version >= 14) {
+		// Ни ctor/dtor, ни таблицы типов членов: вместо них — список
+		// страниц баз-интерфейсов, а в конце записи хвостовое поле (0/1).
+		s.nr_ifaces = buffer_read_int32(r);
+		if (s.nr_ifaces < 0)
+			return NULL;
+		if (s.nr_ifaces) {
+			s.ifaces = xcalloc(s.nr_ifaces, sizeof(int32_t));
+			for (int i = 0; i < s.nr_ifaces; i++)
+				s.ifaces[i] = buffer_read_int32(r);
+		}
+		s.struct_type.name = strdup(buffer_skip_string(r));
+		int slots_size = buffer_read_int32(r);
+		if (slots_size < 0 || slots_size % sizeof(int32_t) != 0) {
+			free(s.ifaces);
+			free(s.struct_type.name);
+			return NULL;
+		}
+		s.nr_slots = slots_size / sizeof(int32_t);
+		struct rsave_heap_struct *obj = xmalloc(sizeof(struct rsave_heap_struct) + slots_size);
+		*obj = s;
+		for (int i = 0; i < s.nr_slots; i++)
+			obj->slots[i] = buffer_read_int32(r);
+		obj->tail = buffer_read_int32(r);
+		return obj;
+	}
 	if (version >= 9)
 		s.seq = buffer_read_int32(r);
 	s.ctor = parse_rsave_symbol(r, version);
@@ -986,6 +1200,27 @@ static struct rsave_heap_delegate *parse_heap_delegate(struct buffer *r, int32_t
 		return NULL;
 	struct rsave_heap_delegate d = { .tag = RSAVE_DELEGATE };
 	d.ref = buffer_read_int32(r);
+	if (version >= 14) {
+		// Два непрочитанных поля, затем число записей; дальше сами записи,
+		// с ИМЕНАМИ методов вместо индексов функций.
+		d.uk1 = buffer_read_int32(r);
+		d.uk2 = buffer_read_int32(r);
+		d.nr_entries = buffer_read_int32(r);
+		if (d.nr_entries < 0)
+			return NULL;
+		struct rsave_heap_delegate *obj = xmalloc(sizeof(struct rsave_heap_delegate));
+		*obj = d;
+		obj->nr_slots = 0;
+		if (d.nr_entries) {
+			obj->entries = xcalloc(d.nr_entries, sizeof(struct rsave_delegate_entry));
+			for (int i = 0; i < d.nr_entries; i++) {
+				obj->entries[i].obj = buffer_read_int32(r);
+				obj->entries[i].method = strdup(buffer_skip_string(r));
+				obj->entries[i].uk = buffer_read_int32(r);
+			}
+		}
+		return obj;
+	}
 	d.seq = buffer_read_int32(r);
 	int slots_size = buffer_read_int32(r);
 	if (slots_size % sizeof(int32_t) != 0) {
@@ -1009,7 +1244,8 @@ enum savefile_error rsave_parse(uint8_t *buf, size_t len, enum rsave_read_mode m
 	buffer_skip(&r, 4);
 
 	rs->version = buffer_read_int32(&r);
-	if (rs->version != 4 && rs->version != 6 && rs->version != 7 && rs->version != 9)
+	if (rs->version != 4 && rs->version != 6 && rs->version != 7 && rs->version != 9
+			&& rs->version != 14)
 		return SAVEFILE_UNSUPPORTED_FORMAT;
 	rs->key = strdup(buffer_skip_string(&r));
 	if (rs->version >= 7) {
@@ -1026,9 +1262,12 @@ enum savefile_error rsave_parse(uint8_t *buf, size_t len, enum rsave_read_mode m
 	}
 
 	parse_return_record(&r, &rs->ip);
-	rs->uk1 = buffer_read_int32(&r);
-	if (rs->uk1)
-		ERROR("unexpected");
+	// В версии 14 поля uk1 после ip нет.
+	if (rs->version < 14) {
+		rs->uk1 = buffer_read_int32(&r);
+		if (rs->uk1)
+			ERROR("unexpected");
+	}
 	rs->stack = parse_int_array(&r, &rs->stack_size);
 	rs->call_frames = parse_call_frames(&r, &rs->nr_call_frames);
 	rs->nr_return_records = buffer_read_int32(&r);
@@ -1036,13 +1275,20 @@ enum savefile_error rsave_parse(uint8_t *buf, size_t len, enum rsave_read_mode m
 	for (int i = 0; i < rs->nr_return_records; i++)
 		parse_return_record(&r, &rs->return_records[i]);
 
-	rs->uk2 = buffer_read_int32(&r);
-	rs->uk3 = buffer_read_int32(&r);
-	rs->uk4 = buffer_read_int32(&r);
-	if (rs->version >= 9)
-		rs->next_seq = buffer_read_int32(&r);
-	if (rs->uk2 || rs->uk3 || rs->uk4)
-		ERROR("unexpected");
+	if (rs->version >= 14) {
+		// Вместо uk2..uk4 и next_seq — одно поле (во всех виденных образах 0).
+		rs->uk2 = buffer_read_int32(&r);
+		if (rs->uk2)
+			ERROR("unexpected");
+	} else {
+		rs->uk2 = buffer_read_int32(&r);
+		rs->uk3 = buffer_read_int32(&r);
+		rs->uk4 = buffer_read_int32(&r);
+		if (rs->version >= 9)
+			rs->next_seq = buffer_read_int32(&r);
+		if (rs->uk2 || rs->uk3 || rs->uk4)
+			ERROR("unexpected");
+	}
 
 	rs->nr_heap_objs = buffer_read_int32(&r);
 	rs->heap = xcalloc(rs->nr_heap_objs, sizeof(void*));
@@ -1075,7 +1321,8 @@ enum savefile_error rsave_parse(uint8_t *buf, size_t len, enum rsave_read_mode m
 			return SAVEFILE_INVALID;
 	}
 
-	if (rs->version >= 6)
+	// Версия 14 таблицы имён функций в хвосте НЕ несёт — файл кончается кучей.
+	if (rs->version >= 6 && rs->version < 14)
 		rs->func_names = parse_string_array(&r, &rs->nr_func_names);
 
 	if (buffer_remaining(&r) != 0)
@@ -1101,10 +1348,31 @@ static void write_return_record(struct buffer *w, struct rsave_return_record *f)
 	buffer_write_int32(w, f->crc);
 }
 
+static void write_rsave14_type(struct buffer *w, struct rsave_array_type *t)
+{
+	buffer_write_int32(w, t->data_type);
+	buffer_write_int32(w, t->sub ? 1 : 0);
+	if (t->sub)
+		write_rsave14_type(w, t->sub);
+	if (rsave14_type_has_name(t->data_type))
+		buffer_write_cstringz(w, t->struct_name ? t->struct_name : "");
+}
+
 static void write_heap_frame(struct buffer *w, enum rsave_heap_tag tag, int32_t version, struct rsave_heap_frame *f)
 {
 	buffer_write_int32(w, f->tag);
 	buffer_write_int32(w, f->ref);
+	if (version >= 14) {
+		if (tag == RSAVE_LOCALS) {
+			buffer_write_cstringz(w, f->func.name);
+			buffer_write_int32(w, f->struct_ptr);
+			buffer_write_int32(w, f->env_ptr);
+		}
+		buffer_write_int32(w, f->nr_slots * sizeof(int32_t));
+		for (int i = 0; i < f->nr_slots; i++)
+			buffer_write_int32(w, f->slots[i]);
+		return;
+	}
 	if (version >= 9)
 		buffer_write_int32(w, f->seq);
 	write_rsave_symbol(w, &f->func);
@@ -1122,6 +1390,11 @@ static void write_heap_string(struct buffer *w, int32_t version, struct rsave_he
 {
 	buffer_write_int32(w, s->tag);
 	buffer_write_int32(w, s->ref);
+	if (version >= 14) {
+		buffer_write_int32(w, s->len);
+		buffer_write_bytes(w, (uint8_t*)s->text, s->len);
+		return;
+	}
 	if (version >= 9)
 		buffer_write_int32(w, s->seq);
 	buffer_write_int32(w, s->uk);
@@ -1133,6 +1406,18 @@ static void write_heap_array(struct buffer *w, int32_t version, struct rsave_hea
 {
 	buffer_write_int32(w, a->tag);
 	buffer_write_int32(w, a->ref);
+	if (version >= 14) {
+		struct rsave_array_type flat = {
+			.data_type = a->data_type,
+			.struct_name = a->struct_type.name,
+		};
+		write_rsave14_type(w, a->type ? a->type : &flat);
+		buffer_write_int32(w, a->is_not_empty);
+		buffer_write_int32(w, a->nr_slots * sizeof(int32_t));
+		for (int i = 0; i < a->nr_slots; i++)
+			buffer_write_int32(w, a->slots[i]);
+		return;
+	}
 	if (version >= 9)
 		buffer_write_int32(w, a->seq);
 	buffer_write_int32(w, a->rank_minus_1);
@@ -1149,6 +1434,17 @@ static void write_heap_struct(struct buffer *w, int32_t version, struct rsave_he
 {
 	buffer_write_int32(w, s->tag);
 	buffer_write_int32(w, s->ref);
+	if (version >= 14) {
+		buffer_write_int32(w, s->nr_ifaces);
+		for (int i = 0; i < s->nr_ifaces; i++)
+			buffer_write_int32(w, s->ifaces[i]);
+		buffer_write_cstringz(w, s->struct_type.name);
+		buffer_write_int32(w, s->nr_slots * sizeof(int32_t));
+		for (int i = 0; i < s->nr_slots; i++)
+			buffer_write_int32(w, s->slots[i]);
+		buffer_write_int32(w, s->tail);
+		return;
+	}
 	if (version >= 9)
 		buffer_write_int32(w, s->seq);
 	write_rsave_symbol(w, &s->ctor);
@@ -1167,6 +1463,26 @@ static void write_heap_delegate(struct buffer *w, int32_t version, struct rsave_
 {
 	buffer_write_int32(w, d->tag);
 	buffer_write_int32(w, d->ref);
+	if (version >= 14) {
+		/*
+		 * Записи делегата в этой версии живут в `entries`, а не в `slots`.
+		 * Если пришло старое представление, данные молча пропали бы —
+		 * ровно так и терялись ВСЕ обработчики, пока resume.c заполнял
+		 * только `slots`. Молчать тут нельзя.
+		 */
+		if (d->nr_slots && !d->nr_entries)
+			WARNING("rsave v14: делегат подан слотами (%d), записи потеряны",
+				d->nr_slots);
+		buffer_write_int32(w, d->uk1);
+		buffer_write_int32(w, d->uk2);
+		buffer_write_int32(w, d->nr_entries);
+		for (int i = 0; i < d->nr_entries; i++) {
+			buffer_write_int32(w, d->entries[i].obj);
+			buffer_write_cstringz(w, d->entries[i].method);
+			buffer_write_int32(w, d->entries[i].uk);
+		}
+		return;
+	}
 	if (version >= 9)
 		buffer_write_int32(w, d->seq);
 	buffer_write_int32(w, d->nr_slots * sizeof(int32_t));
@@ -1188,7 +1504,8 @@ enum savefile_error rsave_write(struct rsave *rs, FILE *out, bool encrypt, int c
 	}
 	if (!rs->comments_only) {
 		write_return_record(&w, &rs->ip);
-		buffer_write_int32(&w, rs->uk1);
+		if (rs->version < 14)
+			buffer_write_int32(&w, rs->uk1);
 		buffer_write_int32(&w, rs->stack_size);
 		for (int i = 0; i < rs->stack_size; i++)
 			buffer_write_int32(&w, rs->stack[i]);
@@ -1213,10 +1530,12 @@ enum savefile_error rsave_write(struct rsave *rs, FILE *out, bool encrypt, int c
 		for (int i = 0; i < rs->nr_return_records; i++)
 			write_return_record(&w, &rs->return_records[i]);
 		buffer_write_int32(&w, rs->uk2);
-		buffer_write_int32(&w, rs->uk3);
-		buffer_write_int32(&w, rs->uk4);
-		if (rs->version >= 9)
-			buffer_write_int32(&w, rs->next_seq);
+		if (rs->version < 14) {
+			buffer_write_int32(&w, rs->uk3);
+			buffer_write_int32(&w, rs->uk4);
+			if (rs->version >= 9)
+				buffer_write_int32(&w, rs->next_seq);
+		}
 		buffer_write_int32(&w, rs->nr_heap_objs);
 		for (int i = 0; i < rs->nr_heap_objs; i++) {
 			enum rsave_heap_tag *tag = rs->heap[i];
@@ -1244,7 +1563,8 @@ enum savefile_error rsave_write(struct rsave *rs, FILE *out, bool encrypt, int c
 				ERROR("unknown rsave heap tag %d", *tag);
 			}
 		}
-		if (rs->version >= 6) {
+		// Версия 14 таблицу имён функций не пишет вовсе.
+		if (rs->version >= 6 && rs->version < 14) {
 			buffer_write_int32(&w, rs->nr_func_names);
 			for (int i = 0; i < rs->nr_func_names; i++)
 				buffer_write_cstringz(&w, rs->func_names[i]);

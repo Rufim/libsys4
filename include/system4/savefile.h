@@ -210,6 +210,23 @@ struct rsave_symbol {
 	int32_t id;  // version 4
 };
 
+/*
+ * Тип элемента массива в версии 14 — РЕКУРСИВНЫЙ, ровно как тип переменной в
+ * ain v11+: `{data, rank_flag, [подтип], [имя]}`. Имя пишется только у
+ * структурных типов, причём `AIN_WRAP` (82) его пишет, а `AIN_OPTION` (86) —
+ * НЕТ (проверено разбором образа оригинала до последнего байта, §5fb-2).
+ * В версии 9 тип плоский: `data_type` + `struct_type` строкой.
+ */
+struct rsave_array_type {
+	int32_t data_type;
+	char *struct_name;              // NULL, если тип не структурный
+	struct rsave_array_type *sub;   // подтип (wrap<...>, option<...>), иначе NULL
+};
+
+struct rsave_array_type *rsave_array_type_new(int32_t data_type, const char *struct_name,
+					      struct rsave_array_type *sub);
+void rsave_array_type_free(struct rsave_array_type *t);
+
 enum rsave_heap_tag {
 	RSAVE_GLOBALS = 0,
 	RSAVE_LOCALS = 1,
@@ -228,6 +245,15 @@ struct rsave_heap_frame {
 	int32_t nr_types;
 	int32_t *types;
 	int32_t struct_ptr;  // only in RSAVE_LOCALS, version 9+
+	/*
+	 * version 14, только у RSAVE_LOCALS: второй указатель на страницу.
+	 * В образе оригинала он != -1 РОВНО У ОДНОГО кадра из сорока — и этот
+	 * кадр лямбда (`MapView@<lambda : MapView@Move(...)>`). Похоже на
+	 * страницу ОКРУЖЕНИЯ лямбды, то есть на штатный аналог нашего
+	 * RSAVE_DG_ENV_MAGIC из resume.c, но одного наблюдения мало: пока
+	 * поле просто переносится из файла в файл.
+	 */
+	int32_t env_ptr;
 	int32_t nr_slots;
 	int32_t slots[];
 };
@@ -249,6 +275,10 @@ struct rsave_heap_array {
 	enum ain_data_type data_type;
 	struct rsave_symbol struct_type;
 	int32_t root_rank;  // -1 if null
+	// version 14: полный тип элемента (см. rsave_array_type). Ведётся
+	// параллельно с data_type/struct_type: те заполняются из корня этого
+	// дерева, чтобы загрузчику образа не пришлось знать про версию.
+	struct rsave_array_type *type;
 	// This is usually `nr_slots > 0 ? 1 : 0`, but is 1 when the size is reduced
 	// to 0 by Array.Erase().
 	int32_t is_not_empty;
@@ -266,14 +296,36 @@ struct rsave_heap_struct {
 	struct rsave_symbol struct_type;
 	int32_t nr_types;
 	int32_t *types;
+	// version 14: ссылки на страницы баз-интерфейсов и хвостовое поле (0/1)
+	int32_t nr_ifaces;
+	int32_t *ifaces;
+	int32_t tail;
 	int32_t nr_slots;
 	int32_t slots[];
+};
+
+/*
+ * Запись делегата. В версии 9 мы кладём её в `slots` тройками/четвёрками
+ * (см. resume.c), в версии 14 у оригинала это список записей
+ * `{объект, ИМЯ МЕТОДА строкой, uk}` — имена, а не индексы функций.
+ */
+struct rsave_delegate_entry {
+	int32_t obj;
+	char *method;
+	int32_t uk;
 };
 
 struct rsave_heap_delegate {
 	enum rsave_heap_tag tag;  // RSAVE_DELEGATE
 	int32_t ref;
 	int32_t seq;
+	// version 14: два поля перед числом записей. Смысл НЕ РАЗГАДАН — бывают
+	// отрицательными (-1, -2, -5) и не сводятся к числу привязанных записей,
+	// поэтому просто переносятся из файла в файл без интерпретации.
+	int32_t uk1;
+	int32_t uk2;
+	int32_t nr_entries;
+	struct rsave_delegate_entry *entries;
 	int32_t nr_slots;
 	int32_t slots[];
 };
