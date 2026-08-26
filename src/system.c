@@ -106,18 +106,38 @@ mem_alloc void *xrealloc_array(void *dst, size_t old_nmemb, size_t new_nmemb, si
 	return dst;
 }
 
+/*
+ * ★СПИСОК АРГУМЕНТОВ ОДНОРАЗОВЫЙ: КАЖДОМУ ПОТРЕБИТЕЛЮ — СВОЯ КОПИЯ.
+ * Здесь `ap` использовался ДВАЖДЫ — сначала в vsnprintf для обработчика ошибки,
+ * потом в vfprintf на stderr. После первого прохода va_list неопределён, и второй
+ * проход — неопределённое поведение: на x86-64 это стабильный SIGSEGV.
+ * Итог был обиднее самой ошибки: ЛЮБАЯ фатальная ошибка движка падала вместо того,
+ * чтобы напечатать причину, и в логе оставался только след обработчика.
+ * Живой случай (2026-08-27): Ixseal валится сегфолтом на старте, в логе три строки
+ * и ни слова о причине; с va_copy причина печатается.
+ */
 _Noreturn void sys_verror(const char *fmt, va_list ap)
 {
-	if (sys_error_handler) {
-		char msg[4096];
-		vsnprintf(msg, 4096, fmt, ap);
-		sys_error_handler(msg);
-	}
+	/*
+	 * ★ПРИЧИНА — В ЖУРНАЛ ПЕРВОЙ, ДИАЛОГ ВТОРЫМ. Обработчик ошибки показывает
+	 * модалку и БЛОКИРУЕТ поток, пока её не закроют; пока он стоял выше, причина
+	 * фатальной ошибки не попадала в лог вовсе — ни у автопрогона, который модалку
+	 * не видит, ни у пользователя, если тот закрыл окно не глядя.
+	 */
 #ifdef __ANDROID__
 	__android_log_vprint(ANDROID_LOG_FATAL, "libsys4", fmt, ap);
 #else
 	vfprintf(stderr, fmt, ap);
+	fflush(stderr);
 #endif
+	if (sys_error_handler) {
+		char msg[4096];
+		va_list copy;
+		va_copy(copy, ap);
+		vsnprintf(msg, 4096, fmt, copy);
+		va_end(copy);
+		sys_error_handler(msg);
+	}
 	sys_exit(1);
 }
 
