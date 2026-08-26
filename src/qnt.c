@@ -168,7 +168,23 @@ static void extract_alpha(struct qnt_header *qnt, uint8_t *pic, const uint8_t *b
 	size_t required_size = ((qnt->width+1) & ~1) * qnt->height;
 	if (!zlib_decompress(raw, ucbuf, b, qnt->alpha_size, &actual_size)
 			|| actual_size < required_size) {
-		WARNING("uncompress failed\n");
+		/*
+		 * ★ОТКАЗ ОБЯЗАН ДАВАТЬ ОПРЕДЕЛЁННЫЙ РЕЗУЛЬТАТ. Буфер альфы выделен
+		 * вызывающим через xmalloc и НЕ обнулён (см. qnt_extract), а копируется
+		 * в RGBA целиком — поэтому простой return оставлял в альфа-канале мусор
+		 * кучи. Это и есть «шум» на кнопках и CG: картинка цела, дыры случайные.
+		 * Непрозрачность здесь честнее прозрачности: невидимый элемент интерфейса
+		 * отладить труднее, чем элемент без мягких краёв.
+		 *
+		 * Порог приёма при этом НЕ ослабляем: `required_size` = ((w+1)&~1)·h —
+		 * ровно столько дельта-декодер ниже и читает (w байт на строку плюс один
+		 * при нечётной ширине). Строгая проверка «ровно ucbuf» отвергала бы годные
+		 * QNT из-за незаписанной строки чётного паддинга, которую никто не читает;
+		 * приём же КОРОЧЕ required_size достраивал бы хвост выдуманными байтами.
+		 */
+		WARNING("QNT: альфа не распакована (%zu < %zu) — считаем CG непрозрачным\n",
+			actual_size, required_size);
+		memset(pic, 0xff, (size_t)qnt->width * qnt->height);
 		free(raw);
 		return;
 	}
